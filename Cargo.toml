@@ -1,0 +1,23 @@
+[package]
+name = "rspxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.189"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = { version = "0.11.18", default-features = false }
+rand = "0.10.3"
+rcgen = "0.14.10"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
+siphasher = "1.0.4"
+socket2 = "0.6.5"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+strip = true
