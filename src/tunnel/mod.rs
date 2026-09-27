@@ -12,12 +12,51 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
 use quinn::rustls;
-use quinn::{MtuDiscoveryConfig, TransportConfig, VarInt};
+use quinn::{TransportConfig, VarInt};
 
 use crate::node::Node;
 use crate::ssu::{Key, Padding};
 
 const ALPN: &[u8] = b"ssu";
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// With debug logging on, periodically logs the QUIC path state of `conn`
+/// (RTT, congestion window, loss) as deltas over the interval.
+fn spawn_stats(conn: quinn::Connection) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    tokio::spawn(async move {
+        let peer = conn.remote_address();
+        let mut prev = conn.stats();
+        let mut tick = tokio::time::interval(STATS_INTERVAL);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = conn.closed() => break,
+            }
+            let s = conn.stats();
+            let (p, q) = (&s.path, &prev.path);
+            let secs = STATS_INTERVAL.as_secs_f64();
+            tracing::debug!(
+                "quic {peer}: rtt={}ms min_rtt={}ms cwnd={}KB mtu={} tx={:.1}Mbps rx={:.1}Mbps sent={} lost={} ({:.1}%) cong_events={} black_holes={}",
+                p.rtt.as_millis(),
+                p.min_rtt.as_millis(),
+                p.cwnd / 1024,
+                p.current_mtu,
+                (s.udp_tx.bytes - prev.udp_tx.bytes) as f64 * 8.0 / 1e6 / secs,
+                (s.udp_rx.bytes - prev.udp_rx.bytes) as f64 * 8.0 / 1e6 / secs,
+                p.sent_packets - q.sent_packets,
+                p.lost_packets - q.lost_packets,
+                (p.lost_packets - q.lost_packets) as f64 * 100.0 / (p.sent_packets - q.sent_packets).max(1) as f64,
+                p.congestion_events - q.congestion_events,
+                p.black_holes_detected,
+            );
+            prev = s;
+        }
+    });
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Congestion {
@@ -35,8 +74,8 @@ pub struct TunnelOpts {
     pub padding: Padding,
     /// Handshake timeout when (re)connecting to the server.
     pub connect_timeout: Duration,
-    /// QUIC-level initial/minimum MTU. Loss is treated as a black hole by quinn,
-    /// which drops back to this size, so raise it on paths known to carry it.
+    /// Fixed QUIC packet size (no MTU discovery); raise it only on paths known
+    /// to carry larger UDP packets reliably.
     pub min_mtu: u16,
 }
 
@@ -167,11 +206,13 @@ fn transport_config(opts: &TunnelOpts) -> TransportConfig {
     t.datagram_receive_buffer_size(Some(1 << 20));
     t.datagram_send_buffer_size(1 << 20);
     t.initial_rtt(Duration::from_millis(200));
+    // Fixed MTU, no path MTU discovery: on real paths full-size UDP packets
+    // were probed successfully and then lost at 75-94%, with quinn flapping
+    // between sizes through black-hole detection. Larger MTUs save only a few
+    // percent of header overhead.
     t.initial_mtu(opts.min_mtu);
     t.min_mtu(opts.min_mtu);
-    let mut mtu = MtuDiscoveryConfig::default();
-    mtu.upper_bound(opts.padding.max_quic_mtu());
-    t.mtu_discovery_config(Some(mtu));
+    t.mtu_discovery_config(None);
     match opts.cc {
         Congestion::Bbr => t.congestion_controller_factory(Arc::new(cc::LossTolerantBbrConfig::default())),
         Congestion::Bbr1 => t.congestion_controller_factory(Arc::new(BbrConfig::default())),

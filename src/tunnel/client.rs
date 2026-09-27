@@ -62,6 +62,11 @@ impl TunnelClient {
         }))
     }
 
+    /// The server this client tunnels to.
+    pub fn server(&self) -> &Address {
+        &self.server
+    }
+
     async fn state(&self) -> Result<Arc<ConnState>, DialError> {
         let mut guard = self.state.lock().await;
         if let Some(st) = &*guard
@@ -90,6 +95,7 @@ impl TunnelClient {
             assocs: Mutex::default(),
         });
         tokio::spawn(datagram_loop(st.clone()));
+        super::spawn_stats(st.conn.clone());
         *guard = Some(st.clone());
         Ok(st)
     }
@@ -127,12 +133,27 @@ impl TunnelClient {
         ))
     }
 
+    /// Sends `req` and reads the status byte. If the connection dies before the
+    /// status arrives (e.g. the server restarted and reset it), the request was
+    /// never answered, so it is retried once on a fresh connection.
+    async fn call(&self, req: &[u8]) -> Result<(SendStream, RecvStream, Arc<ConnState>, u8), DialError> {
+        let mut retried = false;
+        loop {
+            let (send, mut recv, st) = self.open(req).await?;
+            match recv.read_u8().await {
+                Ok(status) => return Ok((send, recv, st, status)),
+                Err(e) if !retried && st.conn.close_reason().is_some() => {
+                    tracing::debug!("ssu connection lost before reply ({e}); retrying");
+                    self.invalidate(&st).await;
+                    retried = true;
+                }
+                Err(e) => return Err(DialError::new(rep::GENERAL, format!("ssu request: {e}"))),
+            }
+        }
+    }
+
     pub async fn connect_tcp(&self, addr: &Address) -> Result<BoxStream, DialError> {
-        let (send, mut recv, _) = self.open(&request(CMD_TCP, addr)).await?;
-        let status = recv
-            .read_u8()
-            .await
-            .map_err(|e| DialError::new(rep::GENERAL, format!("ssu connect {addr}: {e}")))?;
+        let (send, recv, _, status) = self.call(&request(CMD_TCP, addr)).await?;
         if status != rep::SUCCEEDED {
             return Err(DialError::new(status, format!("remote connect {addr} failed")));
         }
@@ -141,9 +162,8 @@ impl TunnelClient {
 
     pub async fn udp_associate(&self) -> Result<TunnelUdp, DialError> {
         let any = Address::Ip(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
-        let (send, mut recv, st) = self.open(&request(CMD_UDP, &any)).await?;
+        let (send, mut recv, st, status) = self.call(&request(CMD_UDP, &any)).await?;
         let err = |e: io::Error| DialError::new(rep::GENERAL, format!("ssu udp associate: {e}"));
-        let status = recv.read_u8().await.map_err(err)?;
         if status != rep::SUCCEEDED {
             return Err(DialError::new(status, "remote udp associate failed"));
         }

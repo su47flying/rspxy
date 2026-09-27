@@ -12,6 +12,7 @@ quinn = { version = "0.11.12", default-features = false, features = ["runtime-to
 quinn-proto = { version = "0.11.18", default-features = false }
 rand = "0.10.3"
 rcgen = "0.14.10"
+ring = "0.17"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
 siphasher = "1.0.4"
 socket2 = "0.6.5"

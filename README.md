@@ -12,7 +12,8 @@ socks5/http client ──TCP──> rspxy (local) ══UDP: SSU + QUIC══> r
 - **HTTP proxy**: CONNECT tunnels and plain absolute-form requests.
 - **QUIC transport** (quinn): one stream per TCP flow over a single shared connection, and UDP relayed
   as QUIC datagrams. The default congestion control is a loss-tolerant BBR that keeps throughput on
-  links with heavy random packet loss.
+  links with heavy random packet loss, while bounding its window by queueing delay and excess loss.
+- **Relay mode**: an `ssu://` server with `-F` forwards through another tunnel (multi-hop).
 - **SSU obfuscation**:
   - Each UDP packet carries a random nonce and is XORed with a per-packet keystream derived from a
     pre-shared key.
@@ -91,12 +92,30 @@ rspxy -L=socks5://:1080 "-F=ssu://1:SECRET@server.example.com:5023?cc=bbr&mtu=13
 rspxy -L=socks5://127.0.0.1:1080 -D
 ```
 
+### Relay (multi-hop)
+
+An `ssu://` server started with `-F` forwards through its own tunnel instead of connecting
+directly. Use this when the client cannot reach the exit server over UDP but a middle host can:
+
+```
+client ══UDP══> relay.example.com:9023 ══UDP══> exit.example.com:9023 ──> internet
+```
+
+```bash
+# exit
+rspxy "-L=ssu://:9023?keys=keys.txt"
+# relay: accepts clients with its own keys.txt, forwards to the exit with an exit key
+rspxy "-L=ssu://:9023?keys=keys.txt" -F=ssu://1:EXIT_SECRET@exit.example.com:9023
+# client
+rspxy -L=socks5://:1080 -F=ssu://1:RELAY_SECRET@relay.example.com:9023
+```
+
 ## Options
 
 | Flag | Description |
 |---|---|
-| `-L NODE` | Listen node, repeatable: `socks5://`, `http://`, or `ssu://` (exit server) |
-| `-F NODE` | Forward node: `ssu://ID:SECRET@host:port` (at most one) |
+| `-L NODE` | Listen node, repeatable: `socks5://`, `http://`, or `ssu://` (tunnel server) |
+| `-F NODE` | Forward node: `ssu://ID:SECRET@host:port` (at most one). Applies to all listeners, including an `ssu://` server, which then acts as a relay |
 | `-D` | Debug logging (`RUST_LOG` is also honored) |
 
 Node format: `scheme://[user:pass@][host]:port[?key=value&...]`. An empty host listens on all
@@ -108,8 +127,8 @@ IPv4 interfaces. `sockssimple://` is accepted as an alias of `ssu://`.
 |---|---|---|---|
 | `keys` | – | server | Path to an `id secret` key table |
 | `key` | – | server | Inline `id:secret`, repeatable (`id:secret@` in the URL also works) |
-| `cc` | `bbr` | both | `bbr` (loss-tolerant), `bbr1` (quinn's stock BBRv1), `cubic`, `newreno`. Each side controls its sending direction |
-| `mtu` | `1200` | both | QUIC initial/minimum MTU (1200–1439). Raise it only on paths known to carry larger packets |
+| `cc` | `bbr` | both | `bbr`: BBR that ignores random loss, with a window ceiling driven by queueing delay and excess loss. Also `bbr1` (quinn's stock BBRv1), `cubic`, `newreno`. Each side controls its sending direction |
+| `mtu` | `1200` | both | Fixed QUIC packet size (1200–1439); there is no path MTU discovery. Raise it only on paths known to carry larger UDP packets reliably |
 | `pad` | off | both | Random padding range for data packets, e.g. `0-64`. Handshake packets are always padded |
 | `timeout` | `10s` | client | Handshake timeout when (re)connecting |
 
@@ -139,7 +158,7 @@ Helper scripts in `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `deploy.sh SSH_HOST` | Build a static binary, upload it, and restart the exit server (`JUMP=host` to upload via a jump host) |
+| `deploy.sh SSH_HOST` | Build a static binary, upload it, and restart the server. Env: `PORT`, `JUMP=host` (upload via a jump host), `SERVER_ARGS='-F=...'` (relay mode), `SERVER_LOG='rspxy=debug,info'` (periodic QUIC stats) |
 | `bench.sh name=PROXY ...` | A/B benchmark of proxies: download/upload throughput, TLS handshake and TTFB medians |
 | `udpperf.py` | Raw UDP throughput/loss test between two hosts over a single UDP port |
 | `socks5_udp_dns.py` | DNS query through SOCKS5 UDP ASSOCIATE, to check UDP relaying |

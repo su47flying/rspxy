@@ -26,10 +26,15 @@ fn opts() -> TunnelOpts {
 }
 
 async fn start_server(keys: &[(u16, &str)]) -> SocketAddr {
+    start_relay(keys, Dialer::Direct).await
+}
+
+/// A server whose outbound goes through `upstream` (a relay when that is a tunnel).
+async fn start_relay(keys: &[(u16, &str)], upstream: Dialer) -> SocketAddr {
     let keys: HashMap<u16, Key> = keys.iter().map(|(id, s)| (*id, Key::derive(*id, s))).collect();
     let ep = server::bind("127.0.0.1:0".parse().unwrap(), keys, &opts()).unwrap();
     let addr = ep.local_addr().unwrap();
-    tokio::spawn(server::run(ep));
+    tokio::spawn(server::run(ep, upstream));
     addr
 }
 
@@ -388,6 +393,38 @@ async fn bulk_transfer_survives_20pct_loss() {
         s.read_to_end(&mut got).await.unwrap();
         eprintln!("10MB over 20% loss in {:?}", start.elapsed());
         assert!(got == pattern(len), "data mismatch (got {} bytes)", got.len());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn two_hop_relay_tcp_and_udp() {
+    timeout(T, async {
+        // client -> relay (key 1) -> exit (key 9) -> target
+        let exit = start_server(&[(9, "exit-key")]).await;
+        let relay = start_relay(&[(1, "relay-key")], tunnel(exit, 9, "exit-key", opts())).await;
+        let proxy = start_socks(tunnel(relay, 1, "relay-key", opts())).await;
+
+        socks_echo_roundtrip(proxy, tcp_echo().await, 256 << 10).await;
+
+        let echo = udp_echo().await;
+        let (_ctrl, udp_relay) = socks_udp_associate(proxy).await;
+        let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut pkt = vec![0, 0, 0];
+        Address::Ip(echo).encode(&mut pkt);
+        pkt.extend_from_slice(b"through two hops");
+        let mut buf = vec![0u8; 2048];
+        let mut got = None;
+        for _ in 0..5 {
+            u.send_to(&pkt, udp_relay).await.unwrap();
+            if let Ok(Ok((n, _))) = timeout(Duration::from_secs(2), u.recv_from(&mut buf)).await {
+                got = Some(buf[..n].to_vec());
+                break;
+            }
+        }
+        let got = got.expect("no udp echo through two hops");
+        assert!(got.ends_with(b"through two hops"));
     })
     .await
     .unwrap();

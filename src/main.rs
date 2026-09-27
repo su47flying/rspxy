@@ -71,7 +71,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             s if is_ssu(s) => {
-                tasks.spawn(tunnel::server::serve(node));
+                // With -F, this server relays through the forward tunnel.
+                tasks.spawn(tunnel::server::serve(node, dialer.clone()));
             }
             s => bail!("unsupported -L scheme {s:?}"),
         }

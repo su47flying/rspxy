@@ -716,6 +716,7 @@ dependencies = [
  "quinn-proto",
  "rand",
  "rcgen",
+ "ring",
  "rustls",
  "siphasher",
  "socket2",

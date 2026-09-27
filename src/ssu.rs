@@ -70,6 +70,26 @@ impl Key {
     }
 }
 
+/// 32-byte secret derived from the whole key table. Used as the QUIC stateless
+/// reset key so a restarted server can reset its clients' stale connections
+/// immediately instead of leaving them to time out.
+pub fn table_secret(keys: &HashMap<u16, Key>) -> [u8; 32] {
+    let mut kids: Vec<u16> = keys.keys().copied().collect();
+    kids.sort_unstable();
+    let mut out = [0u8; 32];
+    for (i, chunk) in out.chunks_mut(8).enumerate() {
+        let mut h = SipHasher24::new_with_keys(0x7265_7365_745f_6b65, i as u64);
+        for kid in &kids {
+            let k = &keys[kid];
+            h.write_u16(*kid);
+            h.write_u64(k.k0);
+            h.write_u64(k.k1);
+        }
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    out
+}
+
 impl fmt::Debug for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Key(..)")

@@ -1,4 +1,5 @@
-//! Tunnel exit: accepts SSU/QUIC connections and connects to the internet.
+//! Tunnel server: accepts SSU/QUIC connections and connects onwards -- directly
+//! (exit node), or through its own `-F` tunnel (relay node).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -9,64 +10,79 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
 
 use super::{TunnelOpts, parse_keys, server_config, udp};
-use crate::dialer::{DirectUdp, connect_direct};
+use crate::dialer::{Dialer, UdpAssoc};
 use crate::node::Node;
 use crate::proto::{Address, CMD_TCP, CMD_UDP, VER, decode_datagram, rep};
 use crate::relay::relay;
-use crate::ssu::{Key, SsuSocket};
+use crate::ssu::{Key, SsuSocket, table_secret};
 
-type Assocs = Arc<Mutex<HashMap<u32, Arc<DirectUdp>>>>;
+type Assocs = Arc<Mutex<HashMap<u32, Arc<UdpAssoc>>>>;
 
 /// Binds the SSU server endpoint.
 pub fn bind(addr: SocketAddr, keys: HashMap<u16, Key>, opts: &TunnelOpts) -> anyhow::Result<Endpoint> {
     let sock = std::net::UdpSocket::bind(addr)?;
+    // Both the stateless-reset key and the connection-ID check key derive from
+    // the key table, so after a restart the server still recognises its old
+    // connection IDs and resets those clients at once (instead of dropping
+    // their packets as forged and leaving them to hit the idle timeout).
+    let secret = table_secret(&keys);
+    let reset_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &secret);
+    let cid_key = u64::from_le_bytes(secret[..8].try_into().unwrap()) ^ 0x6369_645f_6b65_7931;
+    let mut endpoint_config = quinn::EndpointConfig::new(Arc::new(reset_key));
+    endpoint_config.cid_generator(move || Box::new(quinn_proto::HashedConnectionIdGenerator::from_key(cid_key)));
     let ssu = SsuSocket::server(sock, keys, opts.padding)?;
     Ok(Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+        endpoint_config,
         Some(server_config(opts)?),
         Arc::new(ssu),
         Arc::new(quinn::TokioRuntime),
     )?)
 }
 
-pub async fn serve(node: Node) -> anyhow::Result<()> {
+pub async fn serve(node: Node, dialer: Dialer) -> anyhow::Result<()> {
     let keys = parse_keys(&node)?;
     let opts = TunnelOpts::from_node(&node)?;
     let mut ids: Vec<_> = keys.keys().copied().collect();
     ids.sort_unstable();
     let ep = bind(node.bind_addr()?, keys, &opts)?;
+    let via = match &dialer {
+        Dialer::Direct => "direct".to_string(),
+        Dialer::Tunnel(t) => format!("relay via {}", t.server()),
+    };
     tracing::info!(
-        "ssu server on udp {} (key ids {ids:?}, cc {:?})",
+        "ssu server on udp {} (key ids {ids:?}, cc {:?}, {via})",
         ep.local_addr()?,
         opts.cc
     );
-    run(ep).await;
+    run(ep, dialer).await;
     Ok(())
 }
 
-pub async fn run(ep: Endpoint) {
+pub async fn run(ep: Endpoint, dialer: Dialer) {
     while let Some(incoming) = ep.accept().await {
+        let dialer = dialer.clone();
         tokio::spawn(async move {
             match incoming.await {
-                Ok(conn) => handle_conn(conn).await,
+                Ok(conn) => handle_conn(conn, dialer).await,
                 Err(e) => tracing::debug!("ssu handshake failed: {e}"),
             }
         });
     }
 }
 
-async fn handle_conn(conn: Connection) {
+async fn handle_conn(conn: Connection, dialer: Dialer) {
     let peer = conn.remote_address();
     tracing::info!("ssu: connection from {peer}");
     let assocs: Assocs = Arc::default();
     let dgram = tokio::spawn(datagram_loop(conn.clone(), assocs.clone()));
+    super::spawn_stats(conn.clone());
     let next_id = Arc::new(AtomicU32::new(1));
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                let (conn, assocs, next_id) = (conn.clone(), assocs.clone(), next_id.clone());
+                let (conn, assocs, next_id, dialer) = (conn.clone(), assocs.clone(), next_id.clone(), dialer.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(conn, assocs, next_id, send, recv).await {
+                    if let Err(e) = handle_stream(conn, assocs, next_id, dialer, send, recv).await {
                         tracing::debug!("ssu stream: {e}");
                     }
                 });
@@ -98,6 +114,7 @@ async fn handle_stream(
     conn: Connection,
     assocs: Assocs,
     next_id: Arc<AtomicU32>,
+    dialer: Dialer,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> anyhow::Result<()> {
@@ -108,11 +125,11 @@ async fn handle_stream(
     }
     let addr = Address::read_from(&mut recv).await?;
     match cmd {
-        CMD_TCP => match connect_direct(&addr).await {
-            Ok(tcp) => {
+        CMD_TCP => match dialer.connect_tcp(&addr).await {
+            Ok(up) => {
                 tracing::debug!("tcp {addr} via {}", conn.remote_address());
                 send.write_all(&[rep::SUCCEEDED]).await?;
-                relay(tokio::io::join(recv, send), tcp).await?;
+                relay(tokio::io::join(recv, send), up).await?;
             }
             Err(e) => {
                 tracing::info!("tcp {e}");
@@ -120,7 +137,7 @@ async fn handle_stream(
                 send.finish()?;
             }
         },
-        CMD_UDP => udp_assoc(conn, assocs, next_id, send, recv).await?,
+        CMD_UDP => udp_assoc(conn, assocs, next_id, &dialer, send, recv).await?,
         _ => {
             send.write_all(&[rep::CMD_UNSUPPORTED]).await?;
             send.finish()?;
@@ -133,15 +150,16 @@ async fn udp_assoc(
     conn: Connection,
     assocs: Assocs,
     next_id: Arc<AtomicU32>,
+    dialer: &Dialer,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> anyhow::Result<()> {
-    let sock = match DirectUdp::bind().await {
+    let sock = match dialer.udp_associate().await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            send.write_all(&[rep::GENERAL]).await?;
+            send.write_all(&[e.rep]).await?;
             send.finish()?;
-            return Err(e.into());
+            anyhow::bail!("udp associate: {e}");
         }
     };
     let id = next_id.fetch_add(1, Ordering::Relaxed);
