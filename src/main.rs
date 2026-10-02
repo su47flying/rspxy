@@ -5,17 +5,19 @@ use tokio::task::JoinSet;
 
 use rspxy::dialer::Dialer;
 use rspxy::node::Node;
-use rspxy::proxy::{http, socks5};
+use rspxy::proxy::{http, socks5, ss};
 use rspxy::tunnel::{self, client::TunnelClient};
 
-/// socks5/http proxy tunnelled over SSU-obfuscated QUIC on UDP.
+/// socks5/http/shadowsocks proxy tunnelled over SSU-obfuscated QUIC on UDP.
 ///
 /// Server: rspxy -L=ssu://:5023?keys=keys.txt
 /// Client: rspxy -L=socks5://:1080 -L=http://:8080 -F=ssu://7:secret@host:5023
+/// Shadowsocks: rspxy -L=ss://chacha20-ietf-poly1305:password@:8388
 #[derive(Parser)]
 #[command(name = "rspxy", version, verbatim_doc_comment)]
 struct Cli {
     /// Listen node (repeatable): socks5://[user:pass@][ip]:port, http://[user:pass@][ip]:port,
+    /// ss://METHOD:PASSWORD@[ip]:port[?mode=tcp_and_udp|tcp_only|udp_only],
     /// ssu://[id:secret@][ip]:port[?keys=FILE&key=ID:SECRET&cc=bbr&mtu=1200]
     #[arg(short = 'L', value_name = "NODE", action = ArgAction::Append, required = true)]
     listen: Vec<String>,
@@ -69,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     tasks.spawn(socks5::serve(listener, auth, dialer));
                 }
+            }
+            "ss" => {
+                tasks.spawn(ss::serve(node, dialer.clone()));
             }
             s if is_ssu(s) => {
                 // With -F, this server relays through the forward tunnel.

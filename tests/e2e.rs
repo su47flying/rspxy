@@ -1,14 +1,19 @@
-//! End-to-end: socks5/http client -> local proxy -> SSU/QUIC tunnel -> server -> target,
+//! End-to-end: socks5/http/ss client -> local proxy -> SSU/QUIC tunnel -> server -> target,
 //! all in-process on loopback.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rspxy::dialer::Dialer;
+use rspxy::node::Node;
 use rspxy::proto::Address;
-use rspxy::proxy::{http, socks5};
+use rspxy::proxy::ss::aead::{Key as SsKey, Method};
+use rspxy::proxy::ss::tcp::{DecryptReader, copy_encrypt};
+use rspxy::proxy::ss::udp::{open_packet, seal_packet};
+use rspxy::proxy::{http, socks5, ss};
 use rspxy::ssu::Key;
 use rspxy::tunnel::client::TunnelClient;
 use rspxy::tunnel::{TunnelOpts, server};
@@ -425,6 +430,206 @@ async fn two_hop_relay_tcp_and_udp() {
         }
         let got = got.expect("no udp echo through two hops");
         assert!(got.ends_with(b"through two hops"));
+    })
+    .await
+    .unwrap();
+}
+
+async fn start_ss(method: Method, password: &str, upstream: Dialer) -> SocketAddr {
+    let node = Node::parse(&format!("ss://{}:{password}@127.0.0.1:0", method.name())).unwrap();
+    let server = ss::Server::bind(&node, upstream).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+    addr
+}
+
+/// Echo server that counts accepted connections.
+async fn tcp_echo_counted() -> (SocketAddr, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let n = Arc::new(AtomicUsize::new(0));
+    let count = n.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    (addr, n)
+}
+
+/// What a shadowsocks client sends: salt, then `target | data` as chunks.
+async fn ss_request(key: &SsKey, target: &Address, data: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::new();
+    target.encode(&mut plain);
+    plain.extend_from_slice(data);
+    let salt = key.new_salt();
+    let mut wire = Vec::new();
+    copy_encrypt(&mut &plain[..], &mut wire, &salt, &mut key.cipher(&salt))
+        .await
+        .unwrap();
+    wire
+}
+
+/// Sends `wire` (closing the write side afterwards) and decrypts the reply stream.
+async fn ss_exchange(server: SocketAddr, key: &SsKey, wire: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let (mut r, mut w) = TcpStream::connect(server).await?.into_split();
+    let writer = tokio::spawn(async move {
+        w.write_all(&wire).await?;
+        w.shutdown().await
+    });
+    let mut salt = vec![0u8; key.salt_len()];
+    r.read_exact(&mut salt).await?;
+    let mut got = Vec::new();
+    DecryptReader::new(r, key.cipher(&salt)).read_to_end(&mut got).await?;
+    writer.await.unwrap()?;
+    Ok(got)
+}
+
+async fn ss_echo_roundtrip(server: SocketAddr, key: &SsKey, echo: SocketAddr, len: usize) {
+    let data = pattern(len);
+    let wire = ss_request(key, &Address::Ip(echo), &data).await;
+    let got = ss_exchange(server, key, wire).await.unwrap();
+    assert_eq!(got.len(), data.len());
+    assert!(got == data, "echoed data differs");
+}
+
+/// One UDP request/response through an ss server, retried with a fresh salt.
+async fn ss_udp_roundtrip(server: SocketAddr, key: &SsKey, target: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut pkt = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    for _ in 0..5 {
+        seal_packet(key, &Address::Ip(target), payload, &mut pkt);
+        u.send_to(&pkt, server).await.unwrap();
+        if let Ok(Ok((n, _))) = timeout(Duration::from_secs(2), u.recv_from(&mut buf)).await {
+            let (_, from, data) = open_packet(key, &mut buf[..n]).expect("reply must decrypt");
+            assert_eq!(from, Address::Ip(target));
+            return Some(data.to_vec());
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn ss_tcp_and_udp_direct_all_methods() {
+    timeout(T, async {
+        let echo = tcp_echo().await;
+        let uecho = udp_echo().await;
+        for method in [Method::Chacha20Poly1305, Method::Aes128Gcm, Method::Aes256Gcm] {
+            let server = start_ss(method, "pass:word", Dialer::Direct).await;
+            let key = SsKey::new(method, "pass:word");
+            ss_echo_roundtrip(server, &key, echo, 1 << 20).await;
+            let mut flows = Vec::new();
+            for _ in 0..8 {
+                let key = key.clone();
+                flows.push(tokio::spawn(async move {
+                    ss_echo_roundtrip(server, &key, echo, 64 << 10).await
+                }));
+            }
+            for f in flows {
+                f.await.unwrap();
+            }
+            for size in [0, 16, 1400, 8000] {
+                let payload = pattern(size);
+                let got = ss_udp_roundtrip(server, &key, uecho, &payload).await;
+                assert_eq!(got.as_deref(), Some(&payload[..]), "{method} udp size {size}");
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn ss_through_tunnel_tcp_and_udp() {
+    timeout(T, async {
+        // ss client -> ss server (entry) -> SSU tunnel -> exit -> target
+        let exit = start_server(&[(3, "exit-key")]).await;
+        let server = start_ss(Method::Chacha20Poly1305, "pw", tunnel(exit, 3, "exit-key", opts())).await;
+        let key = SsKey::new(Method::Chacha20Poly1305, "pw");
+        ss_echo_roundtrip(server, &key, tcp_echo().await, 256 << 10).await;
+
+        let uecho = udp_echo().await;
+        // 3000 exceeds a QUIC datagram, so it takes the tunnel's stream fallback.
+        for size in [16, 1200, 3000] {
+            let payload = pattern(size);
+            let got = ss_udp_roundtrip(server, &key, uecho, &payload).await;
+            assert_eq!(got.as_deref(), Some(&payload[..]), "udp size {size}");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn ss_wrong_password_and_probes_get_no_reply() {
+    timeout(T, async {
+        let server = start_ss(Method::Chacha20Poly1305, "right", Dialer::Direct).await;
+        let (echo, accepted) = tcp_echo_counted().await;
+        let wrong = SsKey::new(Method::Chacha20Poly1305, "wrong");
+        let junk: Vec<u8> = (0..300).map(|_| rand::random()).collect();
+        for wire in [ss_request(&wrong, &Address::Ip(echo), b"hi").await, junk.clone()] {
+            let mut s = TcpStream::connect(server).await.unwrap();
+            s.write_all(&wire).await.unwrap();
+            // Neither a reply nor a close: the server keeps reading.
+            let mut buf = [0u8; 64];
+            assert!(timeout(Duration::from_millis(500), s.read(&mut buf)).await.is_err());
+            // It still accepts (and discards) more data.
+            s.write_all(&junk).await.unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
+        let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut pkt = Vec::new();
+        seal_packet(&wrong, &Address::Ip(udp_echo().await), b"hi", &mut pkt);
+        u.send_to(&pkt, server).await.unwrap();
+        u.send_to(&junk, server).await.unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(500), u.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn ss_replayed_requests_are_ignored() {
+    timeout(T, async {
+        let server = start_ss(Method::Aes256Gcm, "pw", Dialer::Direct).await;
+        let key = SsKey::new(Method::Aes256Gcm, "pw");
+        let (echo, accepted) = tcp_echo_counted().await;
+        let wire = ss_request(&key, &Address::Ip(echo), b"once").await;
+        assert_eq!(ss_exchange(server, &key, wire.clone()).await.unwrap(), b"once");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+        let mut s = TcpStream::connect(server).await.unwrap();
+        s.write_all(&wire).await.unwrap();
+        let mut buf = [0u8; 64];
+        assert!(timeout(Duration::from_millis(500), s.read(&mut buf)).await.is_err());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "replay reached the target");
+
+        // UDP: the first copy is answered, an identical second one is not.
+        let uecho = udp_echo().await;
+        let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut pkt = Vec::new();
+        seal_packet(&key, &Address::Ip(uecho), b"ping", &mut pkt);
+        let mut buf = vec![0u8; 2048];
+        u.send_to(&pkt, server).await.unwrap();
+        assert!(timeout(Duration::from_secs(2), u.recv_from(&mut buf)).await.is_ok());
+        u.send_to(&pkt, server).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), u.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
     })
     .await
     .unwrap();

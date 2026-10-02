@@ -10,6 +10,9 @@ socks5/http client ──TCP──> rspxy (local) ══UDP: SSU + QUIC══> r
 
 - **SOCKS5** (RFC 1928/1929): CONNECT and UDP ASSOCIATE, so apps that use UDP/QUIC keep working.
 - **HTTP proxy**: CONNECT tunnels and plain absolute-form requests.
+- **Shadowsocks server** (`-L ss://`): AEAD ciphers (`chacha20-ietf-poly1305`, `aes-256-gcm`,
+  `aes-128-gcm`) with TCP and UDP on the same port. With `-F`, standard ss clients such as phone apps
+  connect into the tunnel.
 - **QUIC transport** (quinn): one stream per TCP flow over a single shared connection, and UDP relayed
   as QUIC datagrams. The default congestion control is a loss-tolerant BBR that keeps throughput on
   links with heavy random packet loss, while bounding its window by queueing delay and excess loss.
@@ -92,6 +95,25 @@ rspxy -L=socks5://:1080 "-F=ssu://1:SECRET@server.example.com:5023?cc=bbr&mtu=13
 rspxy -L=socks5://127.0.0.1:1080 -D
 ```
 
+### Shadowsocks
+
+`-L ss://METHOD:PASSWORD@[ip]:port` runs a Shadowsocks server that any standard client can use.
+It listens on TCP and UDP on the same port:
+
+```bash
+# Standalone ss server that connects directly
+rspxy -L=ss://chacha20-ietf-poly1305:PASSWORD@:8388
+
+# ss entry into the tunnel: ss clients -> this host -> SSU/QUIC -> exit server
+rspxy -L=ss://chacha20-ietf-poly1305:PASSWORD@:8388 -F=ssu://1:SECRET@server.example.com:5023
+
+# TCP only (no UDP port)
+rspxy "-L=ss://aes-256-gcm:PASSWORD@:8388?mode=tcp_only"
+```
+
+In the password, write `?` as `%3F` and `%` as `%25`. Other characters, including `:` and `@`,
+work as is. Quote the argument so the shell leaves it alone.
+
 ### Relay (multi-hop)
 
 An `ssu://` server started with `-F` forwards through its own tunnel instead of connecting
@@ -114,12 +136,24 @@ rspxy -L=socks5://:1080 -F=ssu://1:RELAY_SECRET@relay.example.com:9023
 
 | Flag | Description |
 |---|---|
-| `-L NODE` | Listen node, repeatable: `socks5://`, `http://`, or `ssu://` (tunnel server) |
+| `-L NODE` | Listen node, repeatable: `socks5://`, `http://`, `ss://` (Shadowsocks server), or `ssu://` (tunnel server) |
 | `-F NODE` | Forward node: `ssu://ID:SECRET@host:port` (at most one). Applies to all listeners, including an `ssu://` server, which then acts as a relay |
 | `-D` | Debug logging (`RUST_LOG` is also honored) |
 
 Node format: `scheme://[user:pass@][host]:port[?key=value&...]`. An empty host listens on all
 IPv4 interfaces. `sockssimple://` is accepted as an alias of `ssu://`.
+
+`ss://` parameters:
+
+| Param | Default | Meaning |
+|---|---|---|
+| `mode` | `tcp_and_udp` | `tcp_and_udp`, `tcp_only` or `udp_only`, as in shadowsocks configs |
+| `ota` | – | Accepted, but ignored with a warning: one-time auth exists only for the legacy stream ciphers, and the AEAD ciphers already authenticate every chunk and packet |
+
+Supported methods are `chacha20-ietf-poly1305`, `aes-256-gcm` and `aes-128-gcm`. The
+go-shadowsocks2 names `AEAD_CHACHA20_POLY1305`, `AEAD_AES_256_GCM` and `AEAD_AES_128_GCM` also work.
+The legacy stream ciphers (`aes-256-cfb`, `chacha20` and so on) are rejected: they have no
+integrity protection. A UDP session per client address closes after 5 minutes without traffic.
 
 `ssu://` parameters:
 
@@ -143,6 +177,17 @@ kid'      = kid ^ mask16(nonce)
 keystream = wyrand( SipHash-2-4(key[kid], nonce || kid) )
 ```
 
+The ss server follows SIP004: `salt | [len][tag] [payload][tag] ...` with HKDF-SHA1 subkeys over an
+EVP_BytesToKey master key. It also defends against replay and probing:
+
+- **Replay filter**: the server remembers the last 131k–262k salts that passed authentication, plus
+  the salts it sends itself. TCP and UDP keep separate filters. A replayed or reflected request is
+  never dialed.
+- **No reply to probes**: a connection that fails authentication gets no reply. The server keeps
+  reading and discards the data until the 30 s handshake deadline, then closes the connection.
+  So a prober can't tell how many bytes the check needed.
+- **UDP**: packets that fail to decrypt are dropped without a reply.
+
 Inside QUIC, each stream starts with `ver u8 | cmd u8 (1=TCP, 2=UDP) | SOCKS5 address`. The reply
 is a SOCKS5 REP status byte, followed by a `u32` association id for UDP. UDP payloads travel as QUIC
 datagrams tagged with that association id. See `src/ssu.rs` and `src/proto.rs` for details.
@@ -150,7 +195,7 @@ datagrams tagged with that association id. See `src/ssu.rs` and `src/proto.rs` f
 ## Development
 
 ```bash
-cargo test    # unit tests + in-process end-to-end tests (incl. a 20%-loss link)
+cargo test    # unit tests + in-process end-to-end tests (incl. a 20%-loss link and ss over the tunnel)
 cargo clippy --all-targets
 ```
 
