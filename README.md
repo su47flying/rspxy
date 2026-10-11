@@ -41,6 +41,29 @@ CC_x86_64_unknown_linux_musl=gcc cargo build --release --target x86_64-unknown-l
 # binary: target/x86_64-unknown-linux-musl/release/rspxy
 ```
 
+### Windows
+
+Install Rust with the MSVC toolchain and the Visual Studio Build Tools ("Desktop development with C++";
+ring needs its C compiler), then:
+
+```powershell
+cargo build --release
+# binary: target\release\rspxy.exe
+```
+
+Or cross-compile from Linux with mingw-w64:
+
+```bash
+sudo apt install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+# binary: target/x86_64-pc-windows-gnu/release/rspxy.exe
+```
+
+CI also builds `rspxy.exe` on every push; download it from the run's `rspxy-windows-x86_64` artifact.
+rspxy runs as a console program. Windows Firewall asks to allow it the first time it listens. To run it
+in the background, use a service wrapper such as NSSM.
+
 ## Run
 
 ### 1. Exit server
@@ -198,6 +221,8 @@ datagrams tagged with that association id. See `src/ssu.rs` and `src/proto.rs` f
 cargo test    # unit tests + in-process end-to-end tests (incl. a 20%-loss link and ss over the tunnel)
 cargo clippy --all-targets
 ```
+
+CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux and Windows.
 
 Helper scripts in `scripts/`:
 

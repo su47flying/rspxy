@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
 use crate::proto::{Address, rep, rep_from_io};
+use crate::sys;
 use crate::tunnel::client::{TunnelClient, TunnelUdp};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -136,8 +137,10 @@ pub struct DirectUdp {
 
 impl DirectUdp {
     pub async fn bind() -> io::Result<Self> {
+        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        sys::disable_udp_connreset(&sock)?;
         Ok(DirectUdp {
-            sock: UdpSocket::bind("0.0.0.0:0").await?,
+            sock,
             dns: Mutex::default(),
         })
     }

@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use crate::dialer::Dialer;
 use crate::node::Node;
+use crate::sys;
 use aead::{Key, Method};
 
 /// Salts per filter generation; the filter keeps two generations.
@@ -55,6 +56,7 @@ impl Server {
                 let s = UdpSocket::bind(addr)
                     .await
                     .with_context(|| format!("listen udp {addr}"))?;
+                sys::disable_udp_connreset(&s)?;
                 let s2 = socket2::SockRef::from(&s);
                 let _ = s2.set_recv_buffer_size(4 << 20);
                 let _ = s2.set_send_buffer_size(4 << 20);

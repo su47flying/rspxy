@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use crate::dialer::Dialer;
 use crate::proto::{Address, rep};
 use crate::relay::relay;
+use crate::sys;
 
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
@@ -119,6 +120,7 @@ fn canonical(ip: IpAddr) -> IpAddr {
 async fn udp_associate(mut s: TcpStream, dialer: &Dialer) -> anyhow::Result<()> {
     // Bind on the address the client reached us at, so the BND address is routable for it.
     let udp = UdpSocket::bind(SocketAddr::new(s.local_addr()?.ip(), 0)).await?;
+    sys::disable_udp_connreset(&udp)?;
     let assoc = match dialer.udp_associate().await {
         Ok(a) => a,
         Err(e) => {

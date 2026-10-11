@@ -28,6 +28,8 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use siphasher::sip::SipHasher24;
 
+use crate::sys;
+
 pub const MAGIC: u32 = 0x0000_3193;
 const PLAIN_HDR: usize = 6;
 const ENC_HDR: usize = 7;
@@ -292,7 +294,8 @@ impl SsuSocket {
         let s2 = socket2::SockRef::from(&sock);
         let _ = s2.set_recv_buffer_size(4 << 20);
         let _ = s2.set_send_buffer_size(4 << 20);
-        set_dont_fragment(&sock);
+        sys::set_dont_fragment(&sock);
+        sys::disable_udp_connreset(&sock)?;
         Ok(SsuSocket {
             io: tokio::net::UdpSocket::from_std(sock)?,
             role,
@@ -355,31 +358,6 @@ impl SsuSocket {
         };
         buf.copy_within(OVERHEAD..OVERHEAD + len, 0);
         Some(len)
-    }
-}
-
-fn set_dont_fragment(sock: &std::net::UdpSocket) {
-    use std::os::fd::AsRawFd;
-    let fd = sock.as_raw_fd();
-    let v4: libc::c_int = libc::IP_PMTUDISC_PROBE;
-    let v6: libc::c_int = libc::IPV6_PMTUDISC_PROBE;
-    // SAFETY: plain setsockopt on a valid fd with correctly sized int values.
-    unsafe {
-        let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_MTU_DISCOVER,
-            (&v4 as *const libc::c_int).cast(),
-            sz,
-        );
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MTU_DISCOVER,
-            (&v6 as *const libc::c_int).cast(),
-            sz,
-        );
     }
 }
 

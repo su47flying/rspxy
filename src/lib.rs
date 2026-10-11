@@ -6,4 +6,5 @@ pub mod proto;
 pub mod proxy;
 pub mod relay;
 pub mod ssu;
+pub mod sys;
 pub mod tunnel;
