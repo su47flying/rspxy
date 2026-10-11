@@ -24,6 +24,12 @@ socks5/http client ──TCP──> rspxy (local) ══UDP: SSU + QUIC══> r
   - Packets that fail validation are silently dropped, so the server never answers probes.
 - gost-style command line: `-L` (listen) and `-F` (forward) nodes.
 
+## Download
+
+Prebuilt binaries are on the [Releases](https://github.com/su47flying/rspxy/releases) page. There is a
+Windows x86_64 `rspxy.exe` and a static Linux x86_64 (musl) binary, with a `SHA256SUMS` file to verify
+them.
+
 ## Build
 
 Requires a stable Rust toolchain (<https://rustup.rs>).
@@ -60,7 +66,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 # binary: target/x86_64-pc-windows-gnu/release/rspxy.exe
 ```
 
-CI also builds `rspxy.exe` on every push; download it from the run's `rspxy-windows-x86_64` artifact.
+`.cargo/config.toml` links the C runtime statically, so the exe runs without the VC++ redistributable.
 rspxy runs as a console program. Windows Firewall asks to allow it the first time it listens. To run it
 in the background, use a service wrapper such as NSSM.
 
@@ -223,6 +229,15 @@ cargo clippy --all-targets
 ```
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux and Windows.
+
+To publish a release, bump `version` in `Cargo.toml`, then push a matching tag. For example:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` builds the Windows and Linux binaries and attaches them to a GitHub
+release for that tag. The run fails if the tag does not match the version in `Cargo.toml`.
 
 Helper scripts in `scripts/`:
 
