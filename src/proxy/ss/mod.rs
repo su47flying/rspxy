@@ -22,6 +22,8 @@ use aead::{Key, Method};
 
 /// Salts per filter generation; the filter keeps two generations.
 const SALT_GENERATION: usize = 1 << 17;
+/// Ports tried, with port 0, for one that is free for both TCP and UDP.
+const PORT_ATTEMPTS: usize = 16;
 
 struct Ctx {
     key: Key,
@@ -39,31 +41,13 @@ pub struct Server {
 impl Server {
     pub async fn bind(node: &Node, dialer: Dialer) -> anyhow::Result<Server> {
         let (key, tcp, udp) = parse(node)?;
-        let mut addr = node.bind_addr()?;
-        let tcp = match tcp {
-            true => {
-                let l = TcpListener::bind(addr)
-                    .await
-                    .with_context(|| format!("listen tcp {addr}"))?;
-                // With port 0, UDP takes the port TCP was given.
-                addr = l.local_addr()?;
-                Some(l)
-            }
-            false => None,
-        };
-        let udp = match udp {
-            true => {
-                let s = UdpSocket::bind(addr)
-                    .await
-                    .with_context(|| format!("listen udp {addr}"))?;
-                sys::disable_udp_connreset(&s)?;
-                let s2 = socket2::SockRef::from(&s);
-                let _ = s2.set_recv_buffer_size(4 << 20);
-                let _ = s2.set_send_buffer_size(4 << 20);
-                Some(s)
-            }
-            false => None,
-        };
+        let (tcp, udp) = bind_sockets(node.bind_addr()?, tcp, udp).await?;
+        if let Some(s) = &udp {
+            sys::disable_udp_connreset(s)?;
+            let s2 = socket2::SockRef::from(s);
+            let _ = s2.set_recv_buffer_size(4 << 20);
+            let _ = s2.set_send_buffer_size(4 << 20);
+        }
         let via = match &dialer {
             Dialer::Direct => "direct".to_string(),
             Dialer::Tunnel(t) => format!("via ssu://{}", t.server()),
@@ -73,14 +57,19 @@ impl Server {
             (Some(_), None) => "tcp",
             _ => "udp",
         };
-        tracing::info!("ss server on {proto} {addr} ({}, {via})", key.method());
         let ctx = Arc::new(Ctx {
             key,
             dialer,
             tcp_salts: SaltFilter::new(SALT_GENERATION),
             udp_salts: SaltFilter::new(SALT_GENERATION),
         });
-        Ok(Server { tcp, udp, ctx })
+        let server = Server { tcp, udp, ctx };
+        tracing::info!(
+            "ss server on {proto} {} ({}, {via})",
+            server.local_addr()?,
+            server.ctx.key.method()
+        );
+        Ok(server)
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -112,6 +101,42 @@ impl Server {
 
 pub async fn serve(node: Node, dialer: Dialer) -> anyhow::Result<()> {
     Server::bind(&node, dialer).await?.run().await
+}
+
+/// Binds TCP and/or UDP on `addr`. With port 0 both share one port: TCP picks it
+/// and UDP takes the same number. That UDP port can be in use, or on Windows lie
+/// in an excluded port range (WSAEACCES), so then another port is tried.
+async fn bind_sockets(
+    addr: SocketAddr,
+    tcp: bool,
+    udp: bool,
+) -> anyhow::Result<(Option<TcpListener>, Option<UdpSocket>)> {
+    let mut attempt = 1;
+    loop {
+        let l = if tcp {
+            let l = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("listen tcp {addr}"))?;
+            Some(l)
+        } else {
+            None
+        };
+        if !udp {
+            return Ok((l, None));
+        }
+        let uaddr = match &l {
+            Some(l) => l.local_addr()?,
+            None => addr,
+        };
+        match UdpSocket::bind(uaddr).await {
+            Ok(s) => return Ok((l, Some(s))),
+            Err(e) if l.is_some() && addr.port() == 0 && attempt < PORT_ATTEMPTS => {
+                tracing::debug!("ss: udp port {} unavailable ({e}), trying another", uaddr.port());
+                attempt += 1;
+            }
+            Err(e) => return Err(e).with_context(|| format!("listen udp {uaddr}")),
+        }
+    }
 }
 
 /// Returns the key and whether TCP / UDP are enabled.
@@ -192,6 +217,15 @@ mod tests {
         assert!(f.check(b"e")); // rotates: {e} + {c, d}; a and b are forgotten
         assert!(f.check(b"a"));
         assert!(!f.check(b"d"));
+    }
+
+    #[tokio::test]
+    async fn port_0_gives_tcp_and_udp_the_same_port() {
+        for _ in 0..20 {
+            let (l, s) = bind_sockets("127.0.0.1:0".parse().unwrap(), true, true).await.unwrap();
+            let (l, s) = (l.unwrap(), s.unwrap());
+            assert_eq!(l.local_addr().unwrap(), s.local_addr().unwrap());
+        }
     }
 
     #[test]

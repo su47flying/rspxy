@@ -68,7 +68,9 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 `.cargo/config.toml` links the C runtime statically, so the exe runs without the VC++ redistributable.
 rspxy runs as a console program. Windows Firewall asks to allow it the first time it listens. To run it
-in the background, use a service wrapper such as NSSM.
+in the background, use a service wrapper such as NSSM. A listen error with `os error 10013` usually means
+the port is in a range that Windows reserves (`netsh int ipv4 show excludedportrange protocol=udp`, or
+`protocol=tcp`). Pick a port outside those ranges.
 
 ## Run
 
