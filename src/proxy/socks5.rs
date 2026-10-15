@@ -19,8 +19,7 @@ const CMD_UDP_ASSOCIATE: u8 = 3;
 pub async fn serve(listener: TcpListener, auth: Option<(String, String)>, dialer: Dialer) -> anyhow::Result<()> {
     let auth = Arc::new(auth);
     loop {
-        let (s, peer) = listener.accept().await?;
-        let _ = s.set_nodelay(true);
+        let (s, peer) = super::accept(&listener).await;
         let (auth, dialer) = (auth.clone(), dialer.clone());
         tokio::spawn(async move {
             if let Err(e) = handle(s, &auth, &dialer).await {

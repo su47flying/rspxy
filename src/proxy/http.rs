@@ -16,8 +16,7 @@ const MAX_HEAD: usize = 64 << 10;
 pub async fn serve(listener: TcpListener, auth: Option<(String, String)>, dialer: Dialer) -> anyhow::Result<()> {
     let expected = Arc::new(auth.map(|(u, p)| format!("Basic {}", base64(format!("{u}:{p}").as_bytes()))));
     loop {
-        let (s, peer) = listener.accept().await?;
-        let _ = s.set_nodelay(true);
+        let (s, peer) = super::accept(&listener).await;
         let (expected, dialer) = (expected.clone(), dialer.clone());
         tokio::spawn(async move {
             if let Err(e) = handle(s, expected.as_deref(), &dialer).await {

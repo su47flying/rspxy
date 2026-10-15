@@ -93,3 +93,28 @@ pub fn disable_udp_connreset<'s>(sock: impl Into<SockRef<'s>>) -> io::Result<()>
 pub fn disable_udp_connreset<'s>(_sock: impl Into<SockRef<'s>>) -> io::Result<()> {
     Ok(())
 }
+
+/// Raises the soft open-file limit to the hard limit, as Go does at startup.
+/// Each proxied connection holds one or two descriptors, so the usual soft
+/// default of 1024 runs out under a browser's load and accept() fails with EMFILE.
+#[cfg(unix)]
+pub fn raise_nofile_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit with a valid, initialised rlimit.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 || lim.rlim_cur >= lim.rlim_max {
+            return;
+        }
+        let old = lim.rlim_cur;
+        lim.rlim_cur = lim.rlim_max;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+            tracing::debug!("open file limit raised from {old} to {}", lim.rlim_cur);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() {}

@@ -25,8 +25,7 @@ const READ_BUF: usize = 4 * (2 + MAX_PAYLOAD + 2 * TAG_LEN);
 
 pub(super) async fn serve(listener: TcpListener, ctx: Arc<Ctx>) -> anyhow::Result<()> {
     loop {
-        let (s, peer) = listener.accept().await?;
-        let _ = s.set_nodelay(true);
+        let (s, peer) = crate::proxy::accept(&listener).await;
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(s, peer, &ctx).await {

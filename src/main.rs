@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| if cli.debug { "rspxy=debug,info" } else { "info" }.into());
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    rspxy::sys::raise_nofile_limit();
 
     let dialer = match &cli.forward {
         None => Dialer::Direct,
